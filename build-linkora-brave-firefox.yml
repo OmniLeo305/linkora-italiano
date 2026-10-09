@@ -1,4 +1,4 @@
-name: Linkora - Brave o Firefox
+name:.github/workflows/build-linkora-brave-firefox.yml
 
 on:
   workflow_dispatch:
