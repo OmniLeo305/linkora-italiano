@@ -1,0 +1,146 @@
+name: Linkora - Brave o Firefox
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Scarica Linkora originale
+        uses: actions/checkout@v4
+        with:
+          repository: LinkoraApp/Linkora
+          ref: b80956a6eeb1d0a5cda6544ee3457d102589117f
+          path: linkora-src
+
+      - name: Configura Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Configura Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Aggiungi scelta Brave e Firefox
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path('linkora-src/androidApp/src/main/kotlin/com/sakethh/linkora/MainActivity.kt')
+          code = main.read_text(encoding='utf-8')
+
+          def replace_once(old, new):
+              global code
+              found = code.count(old)
+              if found != 1:
+                  raise RuntimeError(f'Codice Linkora cambiato: occorrenze={found} per {old!r}')
+              code = code.replace(old, new, 1)
+
+          replace_once(
+              'import android.content.Intent\n',
+              'import android.content.Intent\n'
+              'import android.content.ActivityNotFoundException\n'
+              'import android.widget.Toast\n',
+          )
+          replace_once(
+              'import androidx.compose.material3.Surface\n',
+              'import androidx.compose.material3.Surface\n'
+              'import androidx.compose.material3.AlertDialog\n'
+              'import androidx.compose.material3.Text\n'
+              'import androidx.compose.material3.TextButton\n',
+          )
+          replace_once(
+              'import androidx.compose.ui.platform.LocalContext\n',
+              'import androidx.compose.ui.platform.LocalContext\n'
+              'import androidx.compose.ui.platform.LocalUriHandler\n'
+              'import androidx.compose.ui.platform.UriHandler\n',
+          )
+          replace_once(
+              '    override fun onCreate(savedInstanceState: Bundle?) {',
+              '''    private fun launchChosenBrowser(url: String, browserPackage: String, browserName: String) {
+                  try {
+                      startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                          addCategory(Intent.CATEGORY_BROWSABLE)
+                          setPackage(browserPackage)
+                      })
+                  } catch (_: ActivityNotFoundException) {
+                      Toast.makeText(this, "$browserName non installato. Installa il browser e riprova.", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {''',
+          )
+          replace_once(
+              '            val navController = rememberNavController()\n',
+              '''            var pendingBrowserUrl by rememberSaveable { mutableStateOf<String?>(null) }
+              val systemUriHandler = LocalUriHandler.current
+              val linkoraUriHandler = remember(systemUriHandler) {
+                  object : UriHandler {
+                      override fun openUri(uri: String) {
+                          if (uri.startsWith("http://", true) || uri.startsWith("https://", true)) {
+                              pendingBrowserUrl = uri
+                          } else {
+                              systemUriHandler.openUri(uri)
+                          }
+                      }
+                  }
+              }
+              val navController = rememberNavController()
+          ''',
+          )
+          replace_once(
+              '                LocalNavController provides navController,\n',
+              '                LocalUriHandler provides linkoraUriHandler,\n'
+              '                LocalNavController provides navController,\n',
+          )
+          replace_once(
+              '                    NotificationPermissionDialogBox(\n',
+              '''                    pendingBrowserUrl?.let { url ->
+                          AlertDialog(
+                              onDismissRequest = { pendingBrowserUrl = null },
+                              title = { Text("Apri collegamento con") },
+                              text = { Text("Scegli il browser da utilizzare per questo collegamento.") },
+                              confirmButton = {
+                                  TextButton(onClick = {
+                                      pendingBrowserUrl = null
+                                      launchChosenBrowser(url, "com.brave.browser", "Brave")
+                                  }) { Text("Brave") }
+                              },
+                              dismissButton = {
+                                  TextButton(onClick = {
+                                      pendingBrowserUrl = null
+                                      launchChosenBrowser(url, "org.mozilla.firefox", "Firefox")
+                                  }) { Text("Firefox") }
+                              },
+                          )
+                      }
+                      NotificationPermissionDialogBox(
+          ''',
+          )
+
+          main.write_text(code, encoding='utf-8')
+          print('MainActivity.kt modificato: scelta Brave o Firefox per i collegamenti HTTP(S).')
+          PY
+
+      - name: Compila APK Android
+        working-directory: linkora-src
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :androidApp:assembleDebug --no-daemon
+
+      - name: Consegna APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linkora-Brave-Firefox-APK
+          path: linkora-src/androidApp/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
