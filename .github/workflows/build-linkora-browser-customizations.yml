@@ -1,0 +1,272 @@
+name: Linkora - Browser personalizzati
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Scarica Linkora
+        uses: actions/checkout@v4
+        with:
+          repository: LinkoraApp/Linkora
+          ref: b80956a6eeb1d0a5cda6544ee3457d102589117f
+          path: linkora-src
+      - name: Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Installa impostazioni browser personalizzate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('linkora-src')
+          def patch(path, old, new):
+              p=root/path
+              source=p.read_text(encoding='utf-8')
+              if source.count(old)!=1:
+                  raise RuntimeError(f'Anchor assente o ambiguo in {path}: {old[:110]!r} count={source.count(old)}')
+              p.write_text(source.replace(old,new,1), encoding='utf-8')
+
+          # Shared Compose state/configuration, stored persistently by Android MainActivity.
+          shared=root/'shared/src/commonMain/kotlin/com/sakethh/linkora/ui/BrowserControls.kt'
+          shared.write_text('''package com.sakethh.linkora.ui
+
+          import androidx.compose.runtime.compositionLocalOf
+
+          data class BrowserChoice(val name: String, val packageName: String)
+
+          data class BrowserControls(
+              val showPopup: Boolean,
+              val popupPackages: Set<String>,
+              val installedBrowsers: List<BrowserChoice>,
+              val onPopupEnabledChange: (Boolean) -> Unit,
+              val onPopupPackagesChange: (Set<String>) -> Unit,
+          )
+
+          val LocalBrowserControls = compositionLocalOf<BrowserControls?> { null }
+          ''', encoding='utf-8')
+
+          main='androidApp/src/main/kotlin/com/sakethh/linkora/MainActivity.kt'
+          patch(main,'import android.content.Intent\n',
+                'import android.content.Intent\nimport android.content.ActivityNotFoundException\nimport android.content.pm.PackageManager\n')
+          patch(main,'import androidx.compose.material3.Surface\n',
+                'import androidx.compose.material3.Surface\nimport androidx.compose.material3.AlertDialog\nimport androidx.compose.material3.Text\nimport androidx.compose.material3.TextButton\n')
+          patch(main,'import androidx.compose.foundation.isSystemInDarkTheme\n',
+                'import androidx.compose.foundation.isSystemInDarkTheme\nimport androidx.compose.foundation.layout.Column\n')
+          patch(main,'import androidx.compose.ui.platform.LocalContext\n',
+                'import androidx.compose.ui.platform.LocalContext\nimport androidx.compose.ui.platform.LocalUriHandler\nimport androidx.compose.ui.platform.UriHandler\n')
+          patch(main,'import com.sakethh.linkora.ui.App\n',
+                'import com.sakethh.linkora.ui.App\nimport com.sakethh.linkora.ui.BrowserChoice\nimport com.sakethh.linkora.ui.BrowserControls\nimport com.sakethh.linkora.ui.LocalBrowserControls\n')
+          patch(main, '    override fun onCreate(savedInstanceState: Bundle?) {',
+          '''    private fun openWithBrowser(url: String, targetPackage: String?) {
+                  val base = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
+                  try {
+                      if (targetPackage.isNullOrBlank()) startActivity(base)
+                      else startActivity(base.setPackage(targetPackage))
+                  } catch (_: ActivityNotFoundException) {
+                      // Browser removed or no matching activity: use Android's system default.
+                      startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE))
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {''')
+          patch(main, '            val navController = rememberNavController()\n',
+          '''            val browserPrefs = remember { getSharedPreferences("personalized_browser_v1", Context.MODE_PRIVATE) }
+              var showBrowserPopup by remember {
+                  mutableStateOf(browserPrefs.getBoolean("show_popup", false))
+              }
+              var enabledPopupPackages by remember {
+                  mutableStateOf(
+                      (browserPrefs.getStringSet("popup_browsers", setOf("com.brave.browser", "org.mozilla.firefox"))
+                          ?: setOf("com.brave.browser", "org.mozilla.firefox")).toSet()
+                  )
+              }
+              val installedBrowsers = remember {
+                  val viewIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com"))
+                      .addCategory(Intent.CATEGORY_BROWSABLE)
+                  packageManager.queryIntentActivities(viewIntent, PackageManager.MATCH_DEFAULT_ONLY)
+                      .map { match ->
+                          BrowserChoice(
+                              name = match.loadLabel(packageManager).toString(),
+                              packageName = match.activityInfo.packageName,
+                          )
+                      }
+                      .distinctBy { it.packageName }
+                      .sortedBy { it.name.lowercase() }
+              }
+              var pendingBrowserUrl by rememberSaveable { mutableStateOf<String?>(null) }
+              val systemUriHandler = LocalUriHandler.current
+              val browserUriHandler = remember(systemUriHandler, showBrowserPopup, enabledPopupPackages, installedBrowsers) {
+                  object : UriHandler {
+                      override fun openUri(uri: String) {
+                          if (!uri.startsWith("https://", ignoreCase = true) && !uri.startsWith("http://", ignoreCase = true)) {
+                              systemUriHandler.openUri(uri)
+                              return
+                          }
+                          if (showBrowserPopup && installedBrowsers.any { it.packageName in enabledPopupPackages }) {
+                              pendingBrowserUrl = uri
+                          } else {
+                              // Nessuna scelta forzata: conserva il comportamento originale
+                              // di Linkora, quindi usa il browser predefinito di Android.
+                              systemUriHandler.openUri(uri)
+                          }
+                      }
+                  }
+              }
+              val browserControls = BrowserControls(
+                  showPopup = showBrowserPopup,
+                  popupPackages = enabledPopupPackages,
+                  installedBrowsers = installedBrowsers,
+                  onPopupEnabledChange = { checked ->
+                      showBrowserPopup = checked
+                      browserPrefs.edit().putBoolean("show_popup", checked).apply()
+                  },
+                  onPopupPackagesChange = { chosen ->
+                      enabledPopupPackages = chosen.toSet()
+                      browserPrefs.edit().putStringSet("popup_browsers", chosen.toSet()).apply()
+                  },
+              )
+              val navController = rememberNavController()
+          ''')
+          patch(main, '                LocalNavController provides navController,\n',
+                '                LocalUriHandler provides browserUriHandler,\n'
+                '                LocalBrowserControls provides browserControls,\n'
+                '                LocalNavController provides navController,\n')
+          patch(main, '                    NotificationPermissionDialogBox(\n',
+          '''                    pendingBrowserUrl?.let { chosenUrl ->
+                          AlertDialog(
+                              onDismissRequest = { pendingBrowserUrl = null },
+                              title = { Text("Apri collegamento con") },
+                              text = {
+                                  Column {
+                                      installedBrowsers.filter { it.packageName in enabledPopupPackages }.forEach { browser ->
+                                          TextButton(onClick = {
+                                              pendingBrowserUrl = null
+                                              openWithBrowser(chosenUrl, browser.packageName)
+                                          }) { Text(browser.name) }
+                                      }
+                                  }
+                              },
+                              confirmButton = {
+                                  TextButton(onClick = { pendingBrowserUrl = null }) { Text("Annulla") }
+                              },
+                          )
+                      }
+                      NotificationPermissionDialogBox(
+          ''')
+
+          settings='shared/src/commonMain/kotlin/com/sakethh/linkora/ui/screens/settings/SettingsScreen.kt'
+          patch(settings, 'import androidx.compose.foundation.background\n',
+                'import androidx.compose.foundation.background\nimport androidx.compose.foundation.rememberScrollState\nimport androidx.compose.foundation.verticalScroll\n')
+          patch(settings, 'import androidx.compose.material3.Button\n',
+                'import androidx.compose.material3.Button\nimport androidx.compose.material3.AlertDialog\nimport androidx.compose.material3.Checkbox\nimport androidx.compose.material3.Switch\nimport androidx.compose.material3.TextButton\n')
+          patch(settings, 'import androidx.compose.runtime.Composable\n',
+                'import androidx.compose.runtime.Composable\nimport androidx.compose.runtime.getValue\nimport androidx.compose.runtime.mutableStateOf\nimport androidx.compose.runtime.remember\nimport androidx.compose.runtime.setValue\n')
+          patch(settings, 'import com.sakethh.linkora.ui.LocalFabController\n',
+                'import com.sakethh.linkora.ui.LocalFabController\nimport com.sakethh.linkora.ui.LocalBrowserControls\n')
+          patch(settings, '    val localizedStrings = LocalizedStrings.current\n    val localFABContext = LocalFabController.current\n',
+          '''    val localizedStrings = LocalizedStrings.current
+              val browserControls = LocalBrowserControls.current
+              var showBrowserSettings by remember { mutableStateOf(false) }
+              val localFABContext = LocalFabController.current
+          ''')
+          patch(settings, '            items(settingsScreenOptions(localizedStrings, navController)) {',
+          '''            if (browserControls != null) {
+                  item {
+                      SettingSectionComponent(
+                          SettingSectionComponentParam(
+                              onClick = { showBrowserSettings = true },
+                              sectionTitle = "Personalizzazioni",
+                              sectionIcon = Icons.Default.Build,
+                          ),
+                      )
+                  }
+              }
+              items(settingsScreenOptions(localizedStrings, navController)) {''')
+          patch(settings, '''    }
+          }
+
+          @Composable
+          fun AppVersionLabel''',
+          '''    }
+              if (showBrowserSettings && browserControls != null) {
+                  AlertDialog(
+                      onDismissRequest = { showBrowserSettings = false },
+                      title = { Text("Personalizzazioni - Browser") },
+                      text = {
+                          Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Text("Chiedi con quale browser aprire", modifier = Modifier.weight(1f))
+                                  Switch(
+                                      checked = browserControls.showPopup,
+                                      onCheckedChange = browserControls.onPopupEnabledChange,
+                                  )
+                              }
+                              Spacer(Modifier.height(16.dp))
+                              Text("Quando questa scelta è disattivata, i link si aprono con il browser predefinito di Android.", style = MaterialTheme.typography.bodySmall)
+                              Spacer(Modifier.height(16.dp))
+                              Text("Browser da mostrare nel popup", style = MaterialTheme.typography.titleSmall)
+                              Text("Seleziona quelli che vuoi aggiungere o rimuovere. Puoi usare qualsiasi browser installato.", style = MaterialTheme.typography.bodySmall)
+                              browserControls.installedBrowsers.forEach { browser ->
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Checkbox(
+                                          checked = browser.packageName in browserControls.popupPackages,
+                                          onCheckedChange = { enabled ->
+                                              val next = browserControls.popupPackages.toMutableSet()
+                                              if (enabled) next.add(browser.packageName) else next.remove(browser.packageName)
+                                              if (next.isNotEmpty()) browserControls.onPopupPackagesChange(next)
+                                          },
+                                      )
+                                      Text(browser.name)
+                                  }
+                              }
+                              Text("Installando altri browser, appariranno qui dopo aver riaperto Linkora.", style = MaterialTheme.typography.bodySmall)
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(onClick = { showBrowserSettings = false }) { Text("Chiudi") }
+                      },
+                  )
+              }
+          }
+
+          @Composable
+          fun AppVersionLabel''')
+
+          manifest='androidApp/src/main/AndroidManifest.xml'
+          patch(manifest, '<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+          '''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW" />
+                      <category android:name="android.intent.category.BROWSABLE" />
+                      <data android:scheme="https" />
+                  </intent>
+              </queries>''')
+          print('Modifica effettuata: popup facoltativo, browser Android predefinito quando spento, elenco browser installati e preferenze persistenti.')
+          PY
+
+      - name: Compila APK Android
+        working-directory: linkora-src
+        run: |
+          chmod +x gradlew
+          ./gradlew :androidApp:assembleDebug --no-daemon
+
+      - name: Pubblica APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linkora-Personalizzazioni-Browser
+          path: linkora-src/androidApp/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
